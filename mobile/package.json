@@ -1,0 +1,42 @@
+{
+  "name": "messenger-secure-mobile",
+  "version": "0.1.0",
+  "description": "Zero-knowledge P2P messenger for iOS and Android",
+  "main": "index.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios",
+    "web": "expo start --web",
+    "eject": "expo eject",
+    "build:ios": "eas build --platform ios",
+    "build:android": "eas build --platform android",
+    "prebuild": "expo prebuild --clean"
+  },
+  "dependencies": {
+    "expo": "^50.0.0",
+    "expo-status-bar": "^1.10.0",
+    "react": "18.2.0",
+    "react-native": "0.73.0",
+    "react-native-gesture-handler": "^2.14.0",
+    "react-native-reanimated": "^3.5.0",
+    "@react-navigation/native": "^6.1.9",
+    "@react-navigation/stack": "^6.3.19",
+    "@react-navigation/bottom-tabs": "^6.5.11",
+    "socket.io-client": "^4.7.2",
+    "tweetnacl": "^1.0.3",
+    "base64-js": "^1.5.1",
+    "uuid": "^9.0.1",
+    "expo-sqlite": "^14.0.0",
+    "expo-permissions": "^14.4.0",
+    "expo-av": "^13.10.0",
+    "react-native-webrtc": "^111.0.0",
+    "axios": "^1.6.2",
+    "@react-native-async-storage/async-storage": "^1.21.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.37",
+    "@types/react-native": "^0.73.0",
+    "typescript": "^5.3.3"
+  }
+}

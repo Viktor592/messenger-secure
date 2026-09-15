@@ -1,0 +1,218 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// User model - minimal data, privacy-first
+model User {
+  id                    String   @id @default(uuid())
+  // Phone hash: SHA256(phone), never store original phone
+  phoneHash             String   @unique @db.VarChar(64)
+  // Curve25519 public key (base64 encoded)
+  publicKey             String   @db.VarChar(512)
+  // Fingerprint for verification (BLAKE2b hash)
+  identityKeyFingerprint String?  @db.VarChar(64)
+  // Display name (optional, user's choice)
+  displayName           String?   @db.VarChar(256)
+  
+  createdAt             DateTime @default(now())
+  lastSeenAt            DateTime @default(now())
+  
+  // Relations
+  sentMessages          Message[] @relation("MessageSender")
+  receivedMessages      Message[] @relation("MessageRecipient")
+  groupsCreated         Group[] @relation("GroupCreator")
+  groupMemberships      GroupMember[]
+  
+  @@index([phoneHash])
+  @@index([lastSeenAt])
+}
+
+// Encrypted message queue - server can't read content
+model Message {
+  id                    String   @id @default(uuid())
+  
+  // Sender info (hashed phone for privacy)
+  fromPhoneHash         String   @db.VarChar(64)
+  sender                User     @relation("MessageSender", fields: [fromPhoneHash], references: [phoneHash], onDelete: Cascade)
+  
+  // Recipient info (hashed phone)
+  toPhoneHash           String   @db.VarChar(64)
+  recipient             User     @relation("MessageRecipient", fields: [toPhoneHash], references: [phoneHash], onDelete: Cascade)
+  
+  // Encrypted message blob (Noise encrypted, base64)
+  encryptedBlob         String   @db.Text
+  
+  // Metadata
+  createdAt             DateTime @default(now())
+  expiresAt             DateTime @default(dbgenerated("(CURRENT_TIMESTAMP + INTERVAL '7 days')"))
+  
+  @@index([toPhoneHash, createdAt])
+  @@index([fromPhoneHash, createdAt])
+  @@index([expiresAt])
+}
+
+// Group model - names only, minimal metadata
+model Group {
+  id                    String   @id @default(uuid())
+  
+  // Group name (user-facing)
+  name                  String   @db.VarChar(256)
+  
+  // Creator's phone hash (for permissions)
+  creatorPhoneHash      String   @db.VarChar(64)
+  creator               User     @relation("GroupCreator", fields: [creatorPhoneHash], references: [phoneHash], onDelete: Cascade)
+  
+  // Optional avatar hash (to detect changes)
+  avatarHash            String?  @db.VarChar(64)
+  
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+  
+  // Relations
+  members               GroupMember[]
+  
+  @@index([creatorPhoneHash])
+}
+
+// Group membership - encrypted member list
+model GroupMember {
+  id                    String   @id @default(uuid())
+  
+  groupId               String
+  group                 Group    @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  
+  // Member's phone hash (hashed for privacy)
+  memberPhoneHash       String   @db.VarChar(64)
+  user                  User     @relation(fields: [memberPhoneHash], references: [phoneHash], onDelete: Cascade)
+  
+  // Role: "admin" or "member"
+  role                  String   @default("member")
+  
+  joinedAt              DateTime @default(now())
+  
+  @@unique([groupId, memberPhoneHash])
+  @@index([groupId])
+  @@index([memberPhoneHash])
+}
+
+// SMS verification - temporary, with TTL
+model SmsCode {
+  id                    String   @id @default(uuid())
+  
+  // Phone hash for lookup
+  phoneHash             String   @unique @db.VarChar(64)
+  
+  // Hashed SMS code (NEVER store plain text)
+  codeHash              String   @db.VarChar(64)
+  
+  // Rate limiting
+  attemptCount          Int      @default(0)
+  maxAttempts           Int      @default(5)
+  
+  // Timestamps
+  createdAt             DateTime @default(now())
+  expiresAt             DateTime @default(dbgenerated("(CURRENT_TIMESTAMP + INTERVAL '10 minutes')"))
+  
+  @@index([phoneHash])
+  @@index([expiresAt])
+}
+
+// User sessions - for token management
+model Session {
+  id                    String   @id @default(uuid())
+  
+  // User's phone hash
+  userPhoneHash         String   @db.VarChar(64)
+  
+  // Session token (not a JWT, just a random token for revocation)
+  tokenHash             String   @unique @db.VarChar(64)
+  
+  // Device info (optional, for multi-device support)
+  deviceId              String?  @db.VarChar(256)
+  deviceName            String?  @db.VarChar(256)
+  
+  // IP address (for logging, deleted after 7 days)
+  ipAddress             String?  @db.VarChar(45)
+  
+  // Timestamps
+  createdAt             DateTime @default(now())
+  expiresAt             DateTime @default(dbgenerated("(CURRENT_TIMESTAMP + INTERVAL '30 days')"))
+  lastActivityAt        DateTime @default(now())
+  
+  @@index([userPhoneHash])
+  @@index([expiresAt])
+}
+
+// Prekeys - for initial contact
+model Prekey {
+  id                    String   @id @default(uuid())
+  
+  // User's phone hash
+  userPhoneHash         String   @db.VarChar(64)
+  
+  // Curve25519 prekey (base64)
+  publicKey             String   @db.VarChar(512)
+  
+  // Signed by identity key
+  signature             String   @db.VarChar(512)
+  
+  // One-time-use flag
+  used                  Boolean  @default(false)
+  
+  createdAt             DateTime @default(now())
+  
+  @@index([userPhoneHash, used])
+}
+
+// Device registry - for multi-device support (optional)
+model Device {
+  id                    String   @id @default(uuid())
+  
+  // Device identifier (IDFA on iOS, Android ID on Android)
+  deviceId              String   @unique @db.VarChar(256)
+  
+  // Associated user's phone hash
+  userPhoneHash         String   @db.VarChar(64)
+  
+  // Device public key (for shared secret)
+  publicKey             String   @db.VarChar(512)
+  
+  // Device type
+  deviceType            String   @db.VarChar(64) // "ios", "android", "web"
+  
+  // Timestamps
+  createdAt             DateTime @default(now())
+  lastSeenAt            DateTime @default(now())
+  
+  @@index([userPhoneHash])
+  @@index([lastSeenAt])
+}
+
+// Audit log - deleted after 7 days (no sensitive data)
+model AuditLog {
+  id                    String   @id @default(uuid())
+  
+  // Event type
+  eventType             String   @db.VarChar(64) // "login", "logout", "message_sent", etc.
+  
+  // Anonymous user ID (not linked to phone)
+  userIdHash            String   @db.VarChar(64)
+  
+  // Generic metadata (no sensitive data)
+  metadata              String?  @db.Text // JSON, safe data only
+  
+  // Timestamp
+  createdAt             DateTime @default(now())
+  expiresAt             DateTime @default(dbgenerated("(CURRENT_TIMESTAMP + INTERVAL '7 days')"))
+  
+  @@index([eventType])
+  @@index([expiresAt])
+}
