@@ -11,17 +11,17 @@ import {
 } from 'react-native';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { AuthStackParamList } from '../../types';
+import { useSendSmsCode } from '../../utils/api-hooks';
 
 type PhoneInputScreenProps = NativeStackScreenProps<AuthStackParamList, 'PhoneInput'>;
 
 const PhoneInputScreen: React.FC<PhoneInputScreenProps> = ({ navigation }) => {
   const [phoneNumber, setPhoneNumber] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
+  const { sendCode, isLoading } = useSendSmsCode();
 
   const handleSendCode = async () => {
     setError('');
-    setIsLoading(true);
 
     try {
       // Validate phone number
@@ -36,29 +36,15 @@ const PhoneInputScreen: React.FC<PhoneInputScreenProps> = ({ navigation }) => {
         : '+7' + cleaned;
 
       // Call backend API to send SMS
-      const response = await fetch('http://YOUR_SERVER:3000/api/auth/register', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ phone: formatted }),
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to send SMS code');
-      }
+      const result = await sendCode(formatted);
 
       // Navigate to code verification
       navigation.navigate('CodeVerification', {
-        phoneHash: data.data.phoneHash,
-        sessionToken: data.data.sessionToken,
+        phoneHash: result.phoneHash,
+        sessionToken: result.sessionToken,
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
-    } finally {
-      setIsLoading(false);
     }
   };
 

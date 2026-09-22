@@ -60,7 +60,11 @@ const CodeVerificationScreen: React.FC<CodeVerificationScreenProps> = ({
     setIsLoading(true);
 
     try {
-      const response = await fetch('http://YOUR_SERVER:3000/api/auth/verify', {
+      const api = require('../../utils/api-client').getApiClient();
+      
+      // Verify code but don't save auth yet
+      // We'll save it after PIN setup
+      const response = await fetch('http://localhost:3000/api/auth/verify', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -78,10 +82,11 @@ const CodeVerificationScreen: React.FC<CodeVerificationScreenProps> = ({
         throw new Error(data.error || 'Invalid verification code');
       }
 
-      // Navigate to PIN setup
+      // Navigate to PIN setup with verified data
       navigation.navigate('PinSetup', {
         phoneHash,
         sessionToken,
+        verificationData: data.data, // Pass the verification data for PIN completion
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
