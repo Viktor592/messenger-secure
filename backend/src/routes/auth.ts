@@ -10,7 +10,10 @@ import { asyncHandler } from '../middleware/logger';
 
 const router = Router();
 const prisma = new PrismaClient();
-const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
+const redis = new Redis({
+  host: process.env.REDIS_HOST || 'localhost',
+  port: parseInt(process.env.REDIS_PORT || '6379'),
+});
 
 // Twilio client (optional, for SMS)
 const twilioClient = process.env.TWILIO_ACCOUNT_SID
@@ -98,10 +101,14 @@ router.post(
       JSON.stringify({ phoneHash, phone: normalizedPhone })
     );
 
-    res.status(200).json({
-      smsRequired: true,
-      sessionToken,
-      message: 'SMS code sent to your phone',
+    return res.status(200).json({
+      data: {
+        smsRequired: true,
+        sessionToken,
+        phoneHash,
+        expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+        message: 'SMS code sent to your phone',
+      },
     });
   })
 );
@@ -113,14 +120,14 @@ router.post(
 router.post(
   '/verify',
   asyncHandler(async (req: Request, res: Response) => {
-    const { sessionToken, smsCode, publicKey } = req.body;
+    const { sessionToken, code, publicKey } = req.body;
 
     // Validate input
     if (!sessionToken || typeof sessionToken !== 'string') {
       throw Errors.INVALID_TOKEN;
     }
 
-    if (!smsCode || typeof smsCode !== 'string' || smsCode.length !== 6) {
+    if (!code || typeof code !== 'string' || code.length !== 6) {
       throw Errors.INVALID_CODE;
     }
 
@@ -134,10 +141,10 @@ router.post(
       throw Errors.INVALID_TOKEN;
     }
 
-    const { phoneHash, phone: normalizedPhone } = JSON.parse(sessionData);
+    const { phoneHash } = JSON.parse(sessionData);
 
     // Verify SMS code
-    const expectedCodeHash = hashValue(smsCode);
+    const expectedCodeHash = hashValue(code);
     const smsRecord = await prisma.smsCode.findUnique({
       where: { phoneHash },
     });
@@ -190,13 +197,14 @@ router.post(
     await redis.del(`session:${sessionToken}`);
 
     // Generate JWT tokens
+    const jwtSecret = process.env.JWT_SECRET || 'dev-secret';
     const accessToken = jwt.sign(
       {
         userId: user.id,
         phoneHash,
       },
-      process.env.JWT_SECRET || 'dev-secret',
-      { expiresIn: process.env.JWT_EXPIRE_ACCESS || '15m' }
+      jwtSecret,
+      { expiresIn: process.env.JWT_EXPIRE_ACCESS || '15m' } as any
     );
 
     const refreshToken = jwt.sign(
@@ -205,51 +213,60 @@ router.post(
         phoneHash,
         type: 'refresh',
       },
-      process.env.JWT_SECRET || 'dev-secret',
-      { expiresIn: process.env.JWT_EXPIRE_REFRESH || '30d' }
+      jwtSecret,
+      { expiresIn: process.env.JWT_EXPIRE_REFRESH || '30d' } as any
     );
 
-    // Store session in database
-    const sessionRecord = await prisma.session.create({
-      data: {
-        userPhoneHash: phoneHash,
-        tokenHash: hashValue(accessToken),
-        expiresAt: new Date(Date.now() + 15 * 60 * 1000), // 15 minutes
-        ipAddress: req.ip,
-      },
-    });
+    // Store refresh token
+    await redis.setex(
+      `token:${refreshToken}`,
+      30 * 24 * 3600, // 30 days
+      JSON.stringify({
+        userId: user.id,
+        phoneHash,
+      })
+    );
 
-    res.status(200).json({
-      userId: user.id,
-      phoneHash,
-      accessToken,
-      refreshToken,
-      expiresIn: 900, // 15 minutes
-      message: 'Successfully authenticated',
+    return res.status(200).json({
+      data: {
+        user: {
+          id: user.id,
+          phoneHash: user.phoneHash,
+          publicKey: user.publicKey,
+          displayName: user.displayName,
+        },
+        accessToken,
+        refreshToken,
+        expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+      },
     });
   })
 );
 
 // ============================================
 // POST /api/auth/refresh
-// Refresh JWT token
+// Refresh access token using refresh token
 // ============================================
 router.post(
   '/refresh',
   asyncHandler(async (req: Request, res: Response) => {
     const { refreshToken } = req.body;
 
-    if (!refreshToken) {
+    if (!refreshToken || typeof refreshToken !== 'string') {
       throw Errors.INVALID_TOKEN;
     }
 
     try {
-      const decoded = jwt.verify(
-        refreshToken,
-        process.env.JWT_SECRET || 'dev-secret'
-      ) as any;
+      const jwtSecret = process.env.JWT_SECRET || 'dev-secret';
+      const decoded = jwt.verify(refreshToken, jwtSecret) as any;
 
       if (decoded.type !== 'refresh') {
+        throw Errors.INVALID_TOKEN;
+      }
+
+      // Check if token is revoked
+      const stored = await redis.get(`token:${refreshToken}`);
+      if (!stored) {
         throw Errors.INVALID_TOKEN;
       }
 
@@ -259,13 +276,16 @@ router.post(
           userId: decoded.userId,
           phoneHash: decoded.phoneHash,
         },
-        process.env.JWT_SECRET || 'dev-secret',
-        { expiresIn: process.env.JWT_EXPIRE_ACCESS || '15m' }
+        jwtSecret,
+        { expiresIn: process.env.JWT_EXPIRE_ACCESS || '15m' } as any
       );
 
-      res.status(200).json({
-        accessToken: newAccessToken,
-        expiresIn: 900,
+      return res.json({
+        data: {
+          accessToken: newAccessToken,
+          refreshToken,
+          expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+        },
       });
     } catch (err) {
       throw Errors.INVALID_TOKEN;
@@ -275,24 +295,22 @@ router.post(
 
 // ============================================
 // POST /api/auth/logout
-// Clear session
+// Revoke tokens
 // ============================================
 router.post(
   '/logout',
   asyncHandler(async (req: Request, res: Response) => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(200).json({ message: 'Logged out' });
+    const { refreshToken } = req.body;
+
+    if (refreshToken && typeof refreshToken === 'string') {
+      await redis.del(`token:${refreshToken}`);
     }
 
-    const token = authHeader.slice(7);
-    const tokenHash = hashValue(token);
-
-    await prisma.session.deleteMany({
-      where: { tokenHash },
+    return res.json({
+      data: {
+        logged_out: true,
+      },
     });
-
-    res.status(200).json({ message: 'Logged out successfully' });
   })
 );
 

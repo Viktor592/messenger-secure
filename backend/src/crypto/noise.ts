@@ -1,5 +1,5 @@
-import * as sodium from 'libsodium.js';
-import { randomBytes } from 'crypto';
+import nacl from 'tweetnacl';
+import { createHash, randomBytes } from 'crypto';
 
 /**
  * Noise Protocol Implementation (NN + Double Ratchet)
@@ -20,14 +20,14 @@ export interface KeyPair {
 }
 
 export interface CipherState {
-  key: Uint8Array;
+  key: Buffer;
   nonce: number;
 }
 
 export interface HandshakeState {
-  ss: Uint8Array; // Symmetric state (internal)
-  ck: Uint8Array; // Chaining key
-  h: Uint8Array; // Hash (for verification)
+  ss: Buffer; // Symmetric state (internal)
+  ck: Buffer; // Chaining key
+  h: Buffer; // Hash (for verification)
 }
 
 export interface EncryptedMessage {
@@ -42,300 +42,217 @@ export interface EncryptedMessage {
 }
 
 // Constants
-const PROTOCOL_NAME = 'Noise_NN_25519_ChaChaPoly_BLAKE2b';
-const HASH_LEN = 32; // BLAKE2b-256
 const KEY_LEN = 32; // ChaCha20 key
-const NONCE_LEN = 12; // ChaCha20Poly1305 nonce
-const DH_LEN = 32; // Curve25519
 const TAG_LEN = 16; // Poly1305 tag
 
 /**
  * Generate a keypair (long-term or ephemeral)
  */
 export function generateKeyPair(): KeyPair {
-  const seed = randomBytes(32);
-  const keypair = sodium.crypto_kx_seed_keypair(seed);
+  const keypair = nacl.box.keyPair();
   
   return {
-    publicKey: sodium.to_base64(keypair.publicKey),
-    privateKey: sodium.to_base64(keypair.privateKey),
+    publicKey: Buffer.from(keypair.publicKey).toString('base64'),
+    privateKey: Buffer.from(keypair.secretKey).toString('base64'),
   };
 }
 
 /**
- * Generate 100 prekeys for first contact
+ * Generate prekeys for first contact
  */
 export function generatePrekeys(count: number = 100): KeyPair[] {
   return Array.from({ length: count }, () => generateKeyPair());
 }
 
 /**
- * Hash function (BLAKE2b)
+ * Hash function (BLAKE2b via SHA256 fallback)
  */
-function hash(data: Uint8Array | Uint8Array[]): Uint8Array {
+function hash(data: Buffer | Buffer[]): Buffer {
   const combined = Array.isArray(data)
-    ? new Uint8Array(data.reduce((acc, arr) => [...acc, ...arr], []))
+    ? Buffer.concat(data)
     : data;
   
-  return sodium.crypto_generichash(HASH_LEN, combined);
+  return createHash('sha256').update(combined).digest();
 }
 
 /**
- * HKDF (simplified version using BLAKE2b)
- * KDF(key, salt) → output
+ * HKDF - Key derivation
  */
-export function hkdf(ikm: Uint8Array, salt: Uint8Array | null = null): Uint8Array {
-  const actualSalt = salt || new Uint8Array(HASH_LEN);
-  
-  // HMAC-BLAKE2b
-  const prk = sodium.crypto_generichash(
-    HASH_LEN,
-    ikm,
-    actualSalt
-  );
-  
-  // Expand
-  const info = new Uint8Array(0);
-  const okm = sodium.crypto_generichash(
-    KEY_LEN,
-    new Uint8Array([...prk, ...info, 0x01])
-  );
-  
-  return okm;
+export function hkdf(ikm: Buffer, salt: Buffer | null = null): Buffer {
+  const prk = createHash('sha256')
+    .update(salt || Buffer.alloc(32, 0))
+    .update(ikm)
+    .digest();
+
+  const info = Buffer.from('messenger-secure', 'utf8');
+  const t1 = createHash('sha256')
+    .update(prk)
+    .update(info)
+    .digest();
+
+  return t1.slice(0, 32);
 }
 
 /**
- * ECDH (Curve25519)
- * Perform Diffie-Hellman key exchange
+ * Diffie-Hellman (Curve25519)
  */
 export function dh(
-  privateKeyBase64: string,
-  publicKeyBase64: string
-): Uint8Array {
-  const privateKey = sodium.from_base64(privateKeyBase64);
-  const publicKey = sodium.from_base64(publicKeyBase64);
+  publicKey: string,
+  privateKey: string
+): Buffer {
+  const pub = Buffer.from(publicKey, 'base64');
+  const priv = Buffer.from(privateKey, 'base64');
   
-  // Use crypto_box for DH (Curve25519)
-  const shared = sodium.crypto_scalarmult(privateKey, publicKey);
-  return shared;
+  const shared = nacl.box.before(pub, priv);
+  return Buffer.from(shared);
 }
 
 /**
- * X3DH Key Exchange (like Signal)
- * Returns shared secret from DH operations
+ * X3DH Key Exchange
  */
 export function x3dh(
-  initiatorIdentityPrivate: string,
-  initiatorEphemeralPrivate: string,
-  responderIdentityPublic: string,
-  responderEphemeralPublic: string,
-  responderPrekeyPublic: string
-): Uint8Array {
-  // DH1: initiator identity ← → responder ephemeral
-  const dh1 = dh(initiatorIdentityPrivate, responderEphemeralPublic);
+  aliceIdentityKey: string,
+  aliceEphemeralKey: string,
+  bobIdentityKey: string,
+  bobPrekey: string
+): Buffer {
+  // DH1 = DH(IKa, SPKb)
+  const dh1 = dh(bobPrekey, aliceIdentityKey);
   
-  // DH2: initiator ephemeral ← → responder identity
-  const dh2 = dh(initiatorEphemeralPrivate, responderIdentityPublic);
+  // DH2 = DH(EKa, IKb)
+  const dh2 = dh(bobIdentityKey, aliceEphemeralKey);
   
-  // DH3: initiator ephemeral ← → responder ephemeral
-  const dh3 = dh(initiatorEphemeralPrivate, responderEphemeralPublic);
+  // DH3 = DH(EKa, SPKb)
+  const dh3 = dh(bobPrekey, aliceEphemeralKey);
   
-  // DH4: initiator identity ← → responder prekey
-  const dh4 = dh(initiatorIdentityPrivate, responderPrekeyPublic);
+  // Combine: SK = HKDF(DH1 || DH2 || DH3)
+  const combined = Buffer.concat([dh1, dh2, dh3]);
   
-  // Concatenate and hash
-  const combined = new Uint8Array(dh1.length + dh2.length + dh3.length + dh4.length);
-  combined.set(dh1, 0);
-  combined.set(dh2, dh1.length);
-  combined.set(dh3, dh1.length + dh2.length);
-  combined.set(dh4, dh1.length + dh2.length + dh3.length);
-  
-  // KDF to derive shared secret
   return hkdf(combined);
 }
 
 /**
- * Initialize cipher state for message encryption
+ * Initialize cipher state
  */
-export function initCipherState(key: Uint8Array): CipherState {
+export function initCipherState(key: Buffer): CipherState {
   return {
-    key,
+    key: key.slice(0, KEY_LEN),
     nonce: 0,
   };
 }
 
 /**
- * Encrypt message using ChaCha20Poly1305
+ * Encrypt message using secretbox
  */
 export function encryptMessage(
-  cipherState: CipherState,
-  plaintext: Uint8Array,
-  additionalData: Uint8Array
-): { ciphertext: Uint8Array; tag: Uint8Array } {
-  const nonce = new Uint8Array(12);
+  plaintext: Buffer,
+  cipherState: CipherState
+): { ciphertext: Buffer; authTag: Buffer } {
+  const nonce = Buffer.alloc(24, 0);
+  nonce.writeUInt32BE(cipherState.nonce, 0);
   
-  // Convert nonce counter to bytes (little-endian)
-  const nonceView = new DataView(nonce.buffer);
-  nonceView.setBigUint64(4, BigInt(cipherState.nonce), true);
+  const ciphertext = nacl.secretbox(plaintext, nonce, cipherState.key);
   
-  // AEAD encrypt
-  const ciphertext = sodium.crypto_aead_chacha20poly1305_encrypt(
-    plaintext,
-    additionalData,
-    null,
-    nonce,
-    cipherState.key
-  );
+  if (!ciphertext) {
+    throw new Error('Encryption failed');
+  }
   
-  // Split ciphertext and tag
-  const ctLen = ciphertext.length - TAG_LEN;
-  const ct = ciphertext.slice(0, ctLen);
-  const tag = ciphertext.slice(ctLen);
+  const ct = Buffer.from(ciphertext);
   
-  // Increment nonce
-  cipherState.nonce += 1;
-  
-  return { ciphertext: ct, tag };
+  return {
+    ciphertext: ct.slice(0, -TAG_LEN),
+    authTag: ct.slice(-TAG_LEN),
+  };
 }
 
 /**
- * Decrypt message using ChaCha20Poly1305
+ * Decrypt message
  */
 export function decryptMessage(
-  cipherState: CipherState,
-  ciphertext: Uint8Array,
-  tag: Uint8Array,
-  additionalData: Uint8Array
-): Uint8Array | null {
-  const nonce = new Uint8Array(12);
+  ciphertext: Buffer,
+  authTag: Buffer,
+  cipherState: CipherState
+): Buffer {
+  const nonce = Buffer.alloc(24, 0);
+  nonce.writeUInt32BE(cipherState.nonce, 0);
   
-  // Convert nonce counter to bytes
-  const nonceView = new DataView(nonce.buffer);
-  nonceView.setBigUint64(4, BigInt(cipherState.nonce), true);
+  const combined = Buffer.concat([ciphertext, authTag]);
+  const plaintext = nacl.secretbox.open(combined, nonce, cipherState.key);
   
-  // Combine ciphertext + tag
-  const combined = new Uint8Array(ciphertext.length + tag.length);
-  combined.set(ciphertext, 0);
-  combined.set(tag, ciphertext.length);
-  
-  try {
-    const plaintext = sodium.crypto_aead_chacha20poly1305_decrypt(
-      null,
-      combined,
-      additionalData,
-      nonce,
-      cipherState.key
-    );
-    
-    // Increment nonce on success
-    cipherState.nonce += 1;
-    return plaintext;
-  } catch (err) {
-    // Authentication failed
-    return null;
+  if (!plaintext) {
+    throw new Error('Decryption failed - authentication tag mismatch');
   }
-}
-
-/**
- * Double Ratchet: update keys after each message
- * Used to achieve perfect forward secrecy
- */
-export function ratchetChainKey(chainKey: Uint8Array): {
-  messageKey: Uint8Array;
-  newChainKey: Uint8Array;
-} {
-  // KDF-CH: derive message key and next chain key
-  const msgKey = hkdf(chainKey, Buffer.from('message', 'utf8'));
-  const newChainKey = hkdf(chainKey, Buffer.from('chain', 'utf8'));
   
-  return { messageKey: msgKey, newChainKey };
+  return Buffer.from(plaintext);
 }
 
 /**
- * Ratchet DH (update ephemeral keys)
- * Called when receiving a new ephemeral key from peer
+ * Ratchet chain key
+ */
+export function ratchetChainKey(chainKey: Buffer): { messageKey: Buffer; newChainKey: Buffer } {
+  const messageKeyMaterial = hash(chainKey);
+  const newChainKeyMaterial = hash(Buffer.concat([chainKey, Buffer.from([0x01])]));
+  
+  return {
+    messageKey: messageKeyMaterial,
+    newChainKey: newChainKeyMaterial,
+  };
+}
+
+/**
+ * Ratchet DH
  */
 export function ratchetDH(
-  currentRootKey: Uint8Array,
-  currentEphemeralPrivate: string,
-  peerEphemeralPublic: string
-): {
-  newRootKey: Uint8Array;
-  newChainKey: Uint8Array;
-} {
-  // Perform DH
-  const shared = dh(currentEphemeralPrivate, peerEphemeralPublic);
-  
-  // Update root key
-  const newRootKey = hkdf(shared, currentRootKey);
-  const newChainKey = hkdf(newRootKey, Buffer.from('chain', 'utf8'));
-  
-  return { newRootKey, newChainKey };
+  dhKey: Buffer,
+  publicKey: string,
+  privateKey: string
+): Buffer {
+  const newShared = dh(publicKey, privateKey);
+  return hkdf(Buffer.concat([dhKey, newShared]));
 }
 
 /**
- * Create a digital signature (for key verification)
+ * Sign message
  */
-export function sign(
-  message: Uint8Array,
-  privateKeyBase64: string
-): string {
-  const privateKey = sodium.from_base64(privateKeyBase64);
-  
-  // Use Ed25519 for signing (derived from Curve25519)
-  // Note: This is a simplified version - in production, use libsodium's signing
-  const signature = sodium.crypto_generichash(64, message, privateKey);
-  
-  return sodium.to_base64(signature);
+export function sign(message: Buffer, privateKey: string): Buffer {
+  const priv = Buffer.from(privateKey, 'base64');
+  const signature = nacl.sign.detached(message, priv);
+  return Buffer.from(signature);
 }
 
 /**
- * Verify a digital signature
+ * Verify signature
  */
 export function verify(
-  message: Uint8Array,
-  publicKeyBase64: string,
-  signatureBase64: string
+  message: Buffer,
+  signature: Buffer,
+  publicKey: string
 ): boolean {
-  try {
-    const publicKey = sodium.from_base64(publicKeyBase64);
-    const signature = sodium.from_base64(signatureBase64);
-    
-    // Compute expected signature
-    const expected = sodium.crypto_generichash(64, message, publicKey);
-    
-    // Constant-time comparison
-    return sodium.compare(signature, expected) === 0;
-  } catch (err) {
-    return false;
-  }
+  const pub = Buffer.from(publicKey, 'base64');
+  return nacl.sign.detached.verify(message, signature, pub);
 }
 
 /**
- * Compute key fingerprint (for verification)
- * BLAKE2b hash of public key
+ * Get fingerprint for TOFU verification
  */
 export function getKeyFingerprint(publicKeyBase64: string): string {
-  const publicKey = sodium.from_base64(publicKeyBase64);
-  const fingerprint = sodium.crypto_generichash(32, publicKey);
-  return sodium.to_hex(fingerprint);
+  const publicKey = Buffer.from(publicKeyBase64, 'base64');
+  const fingerprint = createHash('sha256').update(publicKey).digest();
+  return fingerprint.toString('hex').slice(0, 16).toUpperCase();
 }
 
 /**
- * Hash a value (for lookups, not security-critical)
- * Used for phone number hashing, etc.
+ * Hash value for storage
  */
 export function hashValue(value: string): string {
-  const data = Buffer.from(value, 'utf8');
-  const hash = sodium.crypto_generichash(32, data);
-  return sodium.to_hex(hash);
+  return createHash('sha256').update(value).digest('hex');
 }
 
 /**
- * Generate a random token
+ * Generate random token
  */
 export function generateToken(length: number = 32): string {
-  return sodium.to_base64(randomBytes(length));
+  return randomBytes(length).toString('hex');
 }
 
 /**
@@ -349,23 +266,5 @@ export function verifyToken(provided: string, expected: string): boolean {
     return false;
   }
   
-  return sodium.compare(providedBuf, expectedBuf) === 0;
+  return providedBuf.every((byte, i) => byte === expectedBuf[i]);
 }
-
-export default {
-  generateKeyPair,
-  generatePrekeys,
-  dh,
-  x3dh,
-  initCipherState,
-  encryptMessage,
-  decryptMessage,
-  ratchetChainKey,
-  ratchetDH,
-  sign,
-  verify,
-  getKeyFingerprint,
-  hashValue,
-  generateToken,
-  verifyToken,
-};

@@ -1,41 +1,41 @@
-import { Router, Request, Response } from 'express';
-import { verify } from '../crypto/noise';
-import { prisma } from '../db';
-import { validatePhoneHash, validateDisplayName } from '../utils/validation';
+import { Router, Request, Response, NextFunction } from 'express';
+import { PrismaClient } from '@prisma/client';
 import crypto from 'crypto';
+import { validatePhoneHash, validateDisplayName } from '../utils/validation';
+import { asyncHandler } from '../middleware/logger';
+import { Errors, ApiError } from '../middleware/errors';
 
 const router = Router();
+const prisma = new PrismaClient();
 
 // Middleware для проверки аутентификации
-const requireAuth = (req: Request, res: Response, next: Function) => {
-  const token = req.headers.authorization?.split(' ')[1];
+const requireAuth = (_req: Request, res: Response, next: NextFunction): any => {
+  const token = _req.headers.authorization?.split(' ')[1];
   if (!token) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  // TODO: Verify JWT token
-  req.user = { phoneHash: '' }; // Placeholder
+  // TODO: Verify JWT token and extract phoneHash
+  _req.user = { phoneHash: '' };
   next();
 };
 
 /**
  * GET /api/contacts/search?phone=+7XXXXXXXXXX
  * Поиск контакта по номеру телефона
- * Возвращает: publicKey, identityKeyFingerprint (если найден), displayName
  */
-router.get('/search', requireAuth, async (req: Request, res: Response) => {
-  try {
+router.get(
+  '/search',
+  requireAuth,
+  asyncHandler(async (req: Request, res: Response) => {
     const { phone } = req.query;
 
     if (!phone || typeof phone !== 'string') {
-      return res.status(400).json({ error: 'Phone number required' });
+      throw new ApiError(400, 'Phone number required');
     }
 
-    // Хешируем номер телефона как на фронте
-    const phoneHash = crypto
-      .createHash('sha256')
-      .update(phone)
-      .digest('hex');
+    // Хешируем номер телефона
+    const phoneHash = crypto.createHash('sha256').update(phone).digest('hex');
 
     // Ищем пользователя
     const user = await prisma.user.findUnique({
@@ -66,28 +66,26 @@ router.get('/search', requireAuth, async (req: Request, res: Response) => {
         displayName: user.displayName,
       },
     });
-  } catch (error) {
-    console.error('Contact search error:', error);
-    return res.status(500).json({ error: 'Internal server error' });
-  }
-});
+  })
+);
 
 /**
  * POST /api/contacts/add
- * Добавить контакт в список контактов (локально на клиенте)
- * После добавления контакта, клиент может установить X3DH сессию
+ * Добавить контакт
  */
-router.post('/add', requireAuth, async (req: Request, res: Response) => {
-  try {
+router.post(
+  '/add',
+  requireAuth,
+  asyncHandler(async (req: Request, res: Response) => {
     const { phoneHash, displayName } = req.body;
 
     // Validate
     if (!validatePhoneHash(phoneHash)) {
-      return res.status(400).json({ error: 'Invalid phone hash' });
+      throw new ApiError(400, 'Invalid phone hash');
     }
 
     if (!validateDisplayName(displayName)) {
-      return res.status(400).json({ error: 'Invalid display name' });
+      throw new ApiError(400, 'Invalid display name');
     }
 
     // Проверяем, существует ли пользователь
@@ -102,12 +100,8 @@ router.post('/add', requireAuth, async (req: Request, res: Response) => {
     });
 
     if (!contact) {
-      return res.status(404).json({ error: 'Contact not found' });
+      throw Errors.NOT_FOUND;
     }
-
-    // В реальном приложении здесь был бы список контактов пользователя
-    // Но контакты хранятся локально на клиенте в encrypted storage
-    // Сервер просто подтверждает, что пользователь существует
 
     return res.json({
       data: {
@@ -118,23 +112,21 @@ router.post('/add', requireAuth, async (req: Request, res: Response) => {
         addedAt: new Date().toISOString(),
       },
     });
-  } catch (error) {
-    console.error('Add contact error:', error);
-    return res.status(500).json({ error: 'Internal server error' });
-  }
-});
+  })
+);
 
 /**
  * GET /api/contacts/verify/:fingerprint
- * Проверить идентичность контакта по fingerprint
- * Используется для TOFU (Trust On First Use) верификации
+ * Проверить идентичность контакта
  */
-router.get('/verify/:fingerprint', requireAuth, async (req: Request, res: Response) => {
-  try {
+router.get(
+  '/verify/:fingerprint',
+  requireAuth,
+  asyncHandler(async (req: Request, res: Response) => {
     const { fingerprint } = req.params;
 
     if (!fingerprint || fingerprint.length < 16) {
-      return res.status(400).json({ error: 'Invalid fingerprint' });
+      throw new ApiError(400, 'Invalid fingerprint');
     }
 
     // Ищем пользователя по fingerprint
@@ -166,31 +158,20 @@ router.get('/verify/:fingerprint', requireAuth, async (req: Request, res: Respon
         fingerprint: user.identityKeyFingerprint,
       },
     });
-  } catch (error) {
-    console.error('Verify contact error:', error);
-    return res.status(500).json({ error: 'Internal server error' });
-  }
-});
+  })
+);
 
 /**
  * GET /api/contacts/list
- * Получить список контактов пользователя
- * (В этой реализации контакты хранятся локально,
- *  но сервер может предоставить кэшированный список)
  */
-router.get('/list', requireAuth, async (req: Request, res: Response) => {
-  try {
-    // В реальной системе здесь была бы таблица UserContacts
-    // Для теста возвращаем пустой список
-    // Клиент управляет своим списком контактов локально
-
+router.get(
+  '/list',
+  requireAuth,
+  asyncHandler(async (_req: Request, res: Response) => {
     return res.json({
       data: [],
     });
-  } catch (error) {
-    console.error('List contacts error:', error);
-    return res.status(500).json({ error: 'Internal server error' });
-  }
-});
+  })
+);
 
 export default router;

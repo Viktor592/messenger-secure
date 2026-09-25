@@ -169,7 +169,7 @@ export function setupSocketHandlers(
      * If online → relay directly
      */
     socket.on('message:send', async (data, callback) => {
-      const { toPhoneHash, toUserId, encryptedPayload, deliveryReceipt } = data;
+      const { toPhoneHash, toUserId, encryptedPayload } = data;
 
       try {
         logger.info(`[MESSAGE] ${userId} → ${toUserId || toPhoneHash}`);

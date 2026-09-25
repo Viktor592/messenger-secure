@@ -14,7 +14,7 @@ import contactsRoutes from './routes/contacts';
 import messageRoutes from './routes/messages';
 import groupRoutes from './routes/groups';
 import { setupSocketHandlers } from './socket/handlers';
-import { notFoundHandler, errorHandler } from './middleware/errors';
+import { errorHandler } from './middleware/errors';
 import { requestLogger } from './middleware/logger';
 
 // Load environment variables
@@ -53,7 +53,9 @@ const prisma = new PrismaClient();
 
 // Initialize Redis
 const redis = new Redis({
-  url: process.env.REDIS_URL || 'redis://localhost:6379',
+  host: process.env.REDIS_HOST || 'localhost',
+  port: parseInt(process.env.REDIS_PORT || '6379'),
+  password: process.env.REDIS_PASSWORD,
   retryStrategy: (times) => {
     const delay = Math.min(times * 50, 2000);
     return delay;
@@ -105,7 +107,7 @@ app.use(limiter);
 // ============================================
 
 // Health check
-app.get('/health', (req: Request, res: Response) => {
+app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
@@ -115,11 +117,8 @@ app.use('/api/contacts', contactsRoutes);
 app.use('/api/messages', messageRoutes);
 app.use('/api/groups', groupRoutes);
 
-// 404 handler
-app.use(notFoundHandler);
-
 // Error handler (must be last)
-app.use(errorHandler(logger));
+app.use(errorHandler);
 
 // ============================================
 // Socket.io Setup
@@ -151,7 +150,6 @@ setupSocketHandlers(io, prisma, redis, logger);
 // Socket.io events
 io.on('connection', async (socket) => {
   const userId = socket.data.userId;
-  const phoneHash = socket.data.phoneHash;
 
   logger.info(`User connected: ${userId}`);
 
